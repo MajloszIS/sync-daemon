@@ -3,6 +3,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <syslog.h>
+#include <dirent.h>
 
 void create_daemon() {
     pid_t pid; // zmienna dla PID procesu
@@ -27,6 +28,28 @@ void create_daemon() {
     close(STDIN_FILENO);
     close(STDOUT_FILENO);
     close(STDERR_FILENO);
+}
+
+void list_files(const char *path) {
+
+    // otwieramy katalog - zwraca "uchwyt" do katalogu
+    // DIR pamieta o aktualnej pozycji w katalogu, wiec mozemy czytac kolejne wpisy
+    DIR *dir = opendir(path);
+    if (dir == NULL) {
+        syslog(LOG_ERR, "Cannot open directory: %s", path);
+        return;
+    }
+
+    // struktura przechowująca informacje o jednym wpisie
+    struct dirent *entry;
+
+    // readdir() zwraca kolejny wpis, NULL gdy koniec
+    while ((entry = readdir(dir)) != NULL) {
+        // d_name to nazwa pliku/katalogue
+        syslog(LOG_INFO, "Found: %s", entry->d_name);
+    }
+
+    closedir(dir);
 }
 
 int main(int argc, char *argv[]) {
@@ -74,10 +97,10 @@ int main(int argc, char *argv[]) {
 
     // Główna pętla
     while (1) {
+        syslog(LOG_INFO, "Demon sie obudzil - sprawdzam katalogi");
+        list_files(src);
         syslog(LOG_INFO, "Demon spi...");
         sleep(10);
-        syslog(LOG_INFO, "Demon sie obudzil");
-        // tutaj będzie synchronizacja
     }
 
     closelog();
