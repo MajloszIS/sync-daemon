@@ -30,23 +30,73 @@ void create_daemon() {
     close(STDERR_FILENO);
 }
 
-void list_files(const char *path) {
+void sync_dirs(const char *src, const char *dst) {
 
-    // otwieramy katalog - zwraca "uchwyt" do katalogu
-    // DIR pamieta o aktualnej pozycji w katalogu, wiec mozemy czytac kolejne wpisy
-    DIR *dir = opendir(path);
+    DIR *dir;
+    struct dirent *entry;    // struktura przechowująca informacje o jednym wpisie
+    struct stat src_stat, dst_stat;
+    char src_path[1024];
+    char dst_path[1024];
+
+    // przechodzimy po plikach w src
+    dir = opendir(src); // otwieramy katalog - zwraca "uchwyt" do katalogu
     if (dir == NULL) {
-        syslog(LOG_ERR, "Cannot open directory: %s", path);
+        syslog(LOG_ERR, "Cannot open source directory: %s", src);
         return;
     }
 
-    // struktura przechowująca informacje o jednym wpisie
-    struct dirent *entry;
-
     // readdir() zwraca kolejny wpis, NULL gdy koniec
+    // DIR pamieta o aktualnej pozycji w katalogu, wiec mozemy czytac kolejne wpisy
     while ((entry = readdir(dir)) != NULL) {
-        // d_name to nazwa pliku/katalogue
-        syslog(LOG_INFO, "Found: %s", entry->d_name);
+        // ignorujemy wszystko co nie jest zwykłym plikiem
+        if (entry->d_type != DT_REG) continue;
+
+        // budujemy pełne ścieżki
+        // d_name to nazwa pliku/katalogu
+        snprintf(src_path, sizeof(src_path), "%s/%s", src, entry->d_name);
+        snprintf(dst_path, sizeof(dst_path), "%s/%s", dst, entry->d_name);
+
+        // pobieramy informacje o pliku w src
+        if (stat(src_path, &src_stat) != 0) {
+            syslog(LOG_ERR, "Cannot stat: %s", src_path);
+            continue;
+        }
+
+        // sprawdzamy czy plik istnieje w dst
+        if (stat(dst_path, &dst_stat) != 0) {
+            // plik nie istnieje w dst - trzeba skopiować
+            syslog(LOG_INFO, "New file, copying: %s", entry->d_name);
+            // tutaj będzie kopiowanie
+        } else {
+            // plik istnieje - porównujemy daty modyfikacji
+            if (src_stat.st_mtime > dst_stat.st_mtime) {
+                syslog(LOG_INFO, "File modified, copying: %s", entry->d_name);
+                // tutaj będzie kopiowanie
+            }
+        }
+    }
+
+    closedir(dir);
+
+    // przechodzimy po plikach w dst
+    dir = opendir(dst);
+    if (dir == NULL) {
+        syslog(LOG_ERR, "Cannot open dest directory: %s", dst);
+        return;
+    }
+
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_type != DT_REG) continue;
+
+        snprintf(src_path, sizeof(src_path), "%s/%s", src, entry->d_name);
+        snprintf(dst_path, sizeof(dst_path), "%s/%s", dst, entry->d_name);
+
+        // sprawdzamy czy plik istnieje w src
+        if (stat(src_path, &src_stat) != 0) {
+            // plik nie istnieje w src - usuwamy z dst
+            syslog(LOG_INFO, "File removed from src, deleting: %s", entry->d_name);
+            // tutaj będzie usuwanie
+        }
     }
 
     closedir(dir);
@@ -98,7 +148,7 @@ int main(int argc, char *argv[]) {
     // Główna pętla
     while (1) {
         syslog(LOG_INFO, "Demon sie obudzil - sprawdzam katalogi");
-        list_files(src);
+        sync_dirs(src, dst);
         syslog(LOG_INFO, "Demon spi...");
         sleep(10);
     }
