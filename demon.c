@@ -4,7 +4,11 @@
 #include <sys/stat.h>
 #include <syslog.h>
 #include <dirent.h>
+#include <fcntl.h>
 
+#define BUFFER_SIZE 4096 
+
+// Funkcja tworząca demona
 void create_daemon() {
     pid_t pid; // zmienna dla PID procesu
 
@@ -30,6 +34,56 @@ void create_daemon() {
     close(STDERR_FILENO);
 }
 
+// kopiowanie pliku z src do dst, ustawienie daty modyfikacji dst takiej samej jak src
+void copy_file(const char *src_path, const char *dst_path, struct stat *src_stat) {
+    // otwieramy plik źródłowy tylko do odczytu
+    int src_fd = open(src_path, O_RDONLY);
+    if (src_fd < 0) {
+        syslog(LOG_ERR, "Cannot open source file: %s", src_path);
+        return;
+    }
+
+    // otwieramy/tworzymy plik docelowy do zapisu
+    // 0644     - uprawnienia: właściciel czyta/pisze, reszta tylko czyta
+    int dst_fd = open(dst_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (dst_fd < 0) {
+        syslog(LOG_ERR, "Cannot open dest file: %s", dst_path);
+        close(src_fd);
+        return;
+    }
+
+    // bufor - tymczasowe miejsce w pamięci na dane
+    char buffer[BUFFER_SIZE];
+    ssize_t bytes_read;
+
+    // czytamy kawałkami i zapisujemy
+    while ((bytes_read = read(src_fd, buffer, BUFFER_SIZE)) > 0) {
+        write(dst_fd, buffer, bytes_read);
+    }
+
+    close(src_fd);
+    close(dst_fd);
+
+    // ustawiamy datę modyfikacji dst taką samą jak src
+    struct timespec times[2];
+    times[0] = src_stat->st_atim; // czas dostępu
+    times[1] = src_stat->st_mtim; // czas modyfikacji
+
+    utimensat(AT_FDCWD, dst_path, times, 0);
+
+    syslog(LOG_INFO, "Copied: %s", src_path);
+}
+
+//usuwanie nadmiarowych plików z dst
+void delete_file(const char *path) {
+    if (unlink(path) != 0) {
+        syslog(LOG_ERR, "Cannot delete file: %s", path);
+        return;
+    }
+    syslog(LOG_INFO, "Deleted: %s", path);
+}
+
+// synchronizacja katalogów src i dst
 void sync_dirs(const char *src, const char *dst) {
 
     DIR *dir;
@@ -47,7 +101,8 @@ void sync_dirs(const char *src, const char *dst) {
 
     // readdir() zwraca kolejny wpis, NULL gdy koniec
     // DIR pamieta o aktualnej pozycji w katalogu, wiec mozemy czytac kolejne wpisy
-    while ((entry = readdir(dir)) != NULL) {
+    while ((entry = readdir(dir)) != NULL) 
+    {
         // ignorujemy wszystko co nie jest zwykłym plikiem
         if (entry->d_type != DT_REG) continue;
 
@@ -57,21 +112,26 @@ void sync_dirs(const char *src, const char *dst) {
         snprintf(dst_path, sizeof(dst_path), "%s/%s", dst, entry->d_name);
 
         // pobieramy informacje o pliku w src
-        if (stat(src_path, &src_stat) != 0) {
+        if (stat(src_path, &src_stat) != 0) 
+        {
             syslog(LOG_ERR, "Cannot stat: %s", src_path);
             continue;
         }
 
         // sprawdzamy czy plik istnieje w dst
-        if (stat(dst_path, &dst_stat) != 0) {
+        if (stat(dst_path, &dst_stat) != 0) 
+        {
             // plik nie istnieje w dst - trzeba skopiować
             syslog(LOG_INFO, "New file, copying: %s", entry->d_name);
-            // tutaj będzie kopiowanie
-        } else {
+            copy_file(src_path, dst_path, &src_stat);        
+        } 
+        else 
+        {
             // plik istnieje - porównujemy daty modyfikacji
-            if (src_stat.st_mtime > dst_stat.st_mtime) {
+            if (src_stat.st_mtime > dst_stat.st_mtime) 
+            {
                 syslog(LOG_INFO, "File modified, copying: %s", entry->d_name);
-                // tutaj będzie kopiowanie
+                copy_file(src_path, dst_path, &src_stat);            
             }
         }
     }
@@ -95,7 +155,7 @@ void sync_dirs(const char *src, const char *dst) {
         if (stat(src_path, &src_stat) != 0) {
             // plik nie istnieje w src - usuwamy z dst
             syslog(LOG_INFO, "File removed from src, deleting: %s", entry->d_name);
-            // tutaj będzie usuwanie
+            delete_file(dst_path);
         }
     }
 
