@@ -5,9 +5,10 @@
 #include <syslog.h>
 #include <dirent.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <string.h>
 
-#define BUFFER_SIZE 4096 
+#define BUFFER_SIZE 4096
 
 // Funkcja tworząca demona
 void create_daemon() {
@@ -129,7 +130,7 @@ void sync_dirs(const char *src, const char *dst, int recursive) {
 
     // readdir() zwraca kolejny wpis, NULL gdy koniec
     // DIR pamieta o aktualnej pozycji w katalogu, wiec mozemy czytac kolejne wpisy
-    while ((entry = readdir(dir)) != NULL) 
+    while ((entry = readdir(dir)) != NULL)
     {
         // sprawdzamy czy trafiliśmy na podkatalog
         if (entry->d_type == DT_DIR) {
@@ -163,26 +164,26 @@ void sync_dirs(const char *src, const char *dst, int recursive) {
         snprintf(dst_path, sizeof(dst_path), "%s/%s", dst, entry->d_name);
 
         // pobieramy informacje o pliku w src
-        if (stat(src_path, &src_stat) != 0) 
+        if (stat(src_path, &src_stat) != 0)
         {
             syslog(LOG_ERR, "Cannot stat: %s", src_path);
             continue;
         }
 
         // sprawdzamy czy plik istnieje w dst
-        if (stat(dst_path, &dst_stat) != 0) 
+        if (stat(dst_path, &dst_stat) != 0)
         {
             // plik nie istnieje w dst - trzeba skopiować
             syslog(LOG_INFO, "New file, copying: %s", entry->d_name);
-            copy_file(src_path, dst_path, &src_stat);        
-        } 
-        else 
+            copy_file(src_path, dst_path, &src_stat);
+        }
+        else
         {
             // plik istnieje - porównujemy daty modyfikacji
-            if (src_stat.st_mtime > dst_stat.st_mtime) 
+            if (src_stat.st_mtime > dst_stat.st_mtime)
             {
                 syslog(LOG_INFO, "File modified, copying: %s", entry->d_name);
-                copy_file(src_path, dst_path, &src_stat);            
+                copy_file(src_path, dst_path, &src_stat);
             }
         }
     }
@@ -227,6 +228,10 @@ void sync_dirs(const char *src, const char *dst, int recursive) {
     }
 
     closedir(dir);
+}
+void sigusr1_handler(int signum) {
+    syslog(LOG_INFO, "Odebrano sygnal SIGUSR1 - natychmiastowe wybudzenie demona");
+    // Gdy proces odbiera sygnał i wykonuje handler, trwająca funkcja sleep() w pętli głównej zostaje automatycznie przerwana!
 }
 
 int main(int argc, char *argv[]) {
@@ -282,6 +287,7 @@ int main(int argc, char *argv[]) {
     // konfiguracja sysloga i logowanie informacji o uruchomieniu demona
     openlog("sync-daemon", LOG_PID, LOG_DAEMON);
     syslog(LOG_INFO, "Demon uruchomiony src=%s dst=%s", src, dst);
+    signal(SIGUSR1, sigusr1_handler);
 
     // Główna pętla
     while (1) {
