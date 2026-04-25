@@ -197,6 +197,7 @@ void sync_dirs(const char *src, const char *dst, int recursive) {
     }
 
     while ((entry = readdir(dir)) != NULL) {
+        // rekurencyjne
         // usuwanie nadmiarowych podkatalogow i plików z dst
         if (entry->d_type == DT_DIR) {
             // znowu pomijamy kropki, zeby nie usunac calego systemu
