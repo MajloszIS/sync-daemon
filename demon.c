@@ -5,6 +5,7 @@
 #include <syslog.h>
 #include <dirent.h>
 #include <fcntl.h>
+#include <string.h>
 
 #define BUFFER_SIZE 4096 
 
@@ -83,8 +84,35 @@ void delete_file(const char *path) {
     syslog(LOG_INFO, "Deleted: %s", path);
 }
 
+// usuwanie calego katalogu z zawartoscia (dla opcji rekurencyjnej)
+void delete_dir_recursively(const char *path) {
+    DIR *dir = opendir(path);
+    if (dir == NULL) return;
+    struct dirent *entry;
+    char buf[1024];
+
+    // przechodzimy po zawartosci katalogu
+    while ((entry = readdir(dir)) != NULL) {
+        // ignorujemy . i .. żeby nie cofnąć się w systemie
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
+        
+        snprintf(buf, sizeof(buf), "%s/%s", path, entry->d_name);
+        
+        if (entry->d_type == DT_DIR) {
+            // jesli w srodku jest kolejny katalog, funkcja wywoluje sama siebie zeby go wyczyscic
+            delete_dir_recursively(buf);
+        } else {
+            // jesli to zwykly plik, po prostu go usuwamy
+            delete_file(buf);
+        }
+    }
+    closedir(dir);
+    rmdir(path); // usuniecie samego katalogu na koniec
+    syslog(LOG_INFO, "Deleted dir: %s", path);
+}
+
 // synchronizacja katalogów src i dst
-void sync_dirs(const char *src, const char *dst) {
+void sync_dirs(const char *src, const char *dst, int recursive) {
 
     DIR *dir;
     struct dirent *entry;    // struktura przechowująca informacje o jednym wpisie
@@ -103,9 +131,32 @@ void sync_dirs(const char *src, const char *dst) {
     // DIR pamieta o aktualnej pozycji w katalogu, wiec mozemy czytac kolejne wpisy
     while ((entry = readdir(dir)) != NULL) 
     {
+        // sprawdzamy czy trafiliśmy na podkatalog
+        if (entry->d_type == DT_DIR) {
+            // rekurencyjne dodawanie plików i/lub folderów
+            // pomijamy go jesli flaga -R jest wyłączona ALBO jest to katalog . lub ..
+            if (!recursive || strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
+
+            snprintf(src_path, sizeof(src_path), "%s/%s", src, entry->d_name);
+            snprintf(dst_path, sizeof(dst_path), "%s/%s", dst, entry->d_name);
+
+            if (stat(src_path, &src_stat) == 0) {
+                // tworzymy katalog w dst jesli jeszcze go nie ma
+                if (stat(dst_path, &dst_stat) != 0) {
+                    mkdir(dst_path, src_stat.st_mode); 
+                    syslog(LOG_INFO, "Created dir: %s", dst_path);
+                }
+                // funkcja zatrzymuje się, wchodzi do podkatalogu
+                sync_dirs(src_path, dst_path, recursive);
+            }
+            // instrukcja continue zeby pętla zignorowała ten wpis i poszła do kolejnego pliku/katalogu
+            continue; 
+        }
+
         // ignorujemy wszystko co nie jest zwykłym plikiem
         if (entry->d_type != DT_REG) continue;
 
+        // nie rekurencyjne dodawanie plików
         // budujemy pełne ścieżki
         // d_name to nazwa pliku/katalogu
         snprintf(src_path, sizeof(src_path), "%s/%s", src, entry->d_name);
@@ -146,8 +197,24 @@ void sync_dirs(const char *src, const char *dst) {
     }
 
     while ((entry = readdir(dir)) != NULL) {
+        // usuwanie nadmiarowych podkatalogow i plików z dst
+        if (entry->d_type == DT_DIR) {
+            // znowu pomijamy kropki, zeby nie usunac calego systemu
+            if (!recursive || strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
+
+            snprintf(src_path, sizeof(src_path), "%s/%s", src, entry->d_name);
+            snprintf(dst_path, sizeof(dst_path), "%s/%s", dst, entry->d_name);
+            // sprawdzamy czy katalog istnieje w src, jesli go tam nie ma to usuwamy z dst
+            if (stat(src_path, &src_stat) != 0) {
+                syslog(LOG_INFO, "Dir removed from src, deleting: %s", entry->d_name);
+                delete_dir_recursively(dst_path);
+            }
+            continue;
+        }
+
         if (entry->d_type != DT_REG) continue;
 
+        // nie rekurencyjne usuwanie plików
         snprintf(src_path, sizeof(src_path), "%s/%s", src, entry->d_name);
         snprintf(dst_path, sizeof(dst_path), "%s/%s", dst, entry->d_name);
 
@@ -165,13 +232,24 @@ void sync_dirs(const char *src, const char *dst) {
 int main(int argc, char *argv[]) {
     // Sprawdzenie liczby argumentów
     if (argc < 3) {
-        fprintf(stderr, "Użycie: %s <src> <dst>\n", argv[0]);
+        fprintf(stderr, "Użycie: %s [-R] <src> <dst>\n", argv[0]);
         return 1;
     }
 
-    //Pobranie argumentów
     char *src = argv[1];
     char *dst = argv[2];
+    int recursive = 0;
+
+    // Sprawdzamy, czy użytkownik podał 4 argumenty i czy tym czwartym jest "-R"
+    if (argc == 4 && strcmp(argv[3], "-R") == 0) {
+        recursive = 1;
+    }
+
+    // Dodatkowe sprawdzenie czy podano obie sciezki
+    if (src == NULL || dst == NULL) {
+        fprintf(stderr, "Błąd: Brak ścieżki źródłowej lub docelowej\n");
+        return 1;
+    }
 
     // stat - przechowuje infmacje o pliku st
     struct stat st;
@@ -208,7 +286,7 @@ int main(int argc, char *argv[]) {
     // Główna pętla
     while (1) {
         syslog(LOG_INFO, "Demon sie obudzil - sprawdzam katalogi");
-        sync_dirs(src, dst);
+        sync_dirs(src, dst, recursive);
         syslog(LOG_INFO, "Demon spi...");
         sleep(10);
     }
