@@ -230,8 +230,9 @@ void sync_dirs(const char *src, const char *dst, int recursive) {
     closedir(dir);
 }
 void sigusr1_handler(int signum) {
+    (void)signum;
     syslog(LOG_INFO, "Odebrano sygnal SIGUSR1 - natychmiastowe wybudzenie demona");
-    // Gdy proces odbiera sygnał i wykonuje handler, trwająca funkcja sleep() w pętli głównej zostaje automatycznie przerwana!
+    // Gdy proces odbiera sygnał i wykonuje handler, trwająca funkcja sleep() w pętli głównej zostaje automatycznie przerwana
 }
 
 int main(int argc, char *argv[]) {
