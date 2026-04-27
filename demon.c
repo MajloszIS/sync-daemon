@@ -7,8 +7,10 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <string.h>
+#include <sys/mman.h>
 
 #define BUFFER_SIZE 4096
+#define DEFAULT_THRESHOLD 1048576
 
 // Funkcja tworząca demona
 void create_daemon() {
@@ -37,7 +39,7 @@ void create_daemon() {
 }
 
 // kopiowanie pliku z src do dst, ustawienie daty modyfikacji dst takiej samej jak src
-void copy_file(const char *src_path, const char *dst_path, struct stat *src_stat) {
+void copy_file(const char *src_path, const char *dst_path, struct stat *src_stat, off_t threshold) {
     // otwieramy plik źródłowy tylko do odczytu
     int src_fd = open(src_path, O_RDONLY);
     if (src_fd < 0) {
@@ -54,14 +56,43 @@ void copy_file(const char *src_path, const char *dst_path, struct stat *src_stat
         return;
     }
 
-    // bufor - tymczasowe miejsce w pamięci na dane
-    char buffer[BUFFER_SIZE];
-    ssize_t bytes_read;
+    // rozmiar pliku z src_stat
+    off_t file_size = src_stat->st_size;
 
-    // czytamy kawałkami i zapisujemy
-    while ((bytes_read = read(src_fd, buffer, BUFFER_SIZE)) > 0) {
-        write(dst_fd, buffer, bytes_read);
+    if (file_size > threshold) {
+        // DUŻY PLIK - używamy mmap
+        syslog(LOG_INFO, "Using mmap for: %s", src_path);
+
+        // mapujemy cały plik źródłowy do pamięci
+        // PROT_READ - tylko do odczytu
+        // MAP_SHARED - współdzielona mapa
+        void *map = mmap(NULL, file_size, PROT_READ, MAP_SHARED, src_fd, 0);
+        if (map == MAP_FAILED) {
+            syslog(LOG_ERR, "mmap failed for: %s", src_path);
+            close(src_fd);
+            close(dst_fd);
+            return;
+        }
+
+        // zapisujemy całą mapę do pliku docelowego jednym wywołaniem write
+        write(dst_fd, map, file_size);
+
+        // zwalniamy mapę z pamięci
+        munmap(map, file_size);
+    } else {
+        // MAŁY PLIK - używamy bufora
+        syslog(LOG_INFO, "Using buffer for: %s", src_path);
+
+        // bufor - tymczasowe miejsce w pamięci na dane
+        char buffer[BUFFER_SIZE];
+        ssize_t bytes_read;
+
+        // czytamy kawałkami i zapisujemy
+        while ((bytes_read = read(src_fd, buffer, BUFFER_SIZE)) > 0) {
+            write(dst_fd, buffer, bytes_read);
+        }
     }
+    
 
     close(src_fd);
     close(dst_fd);
@@ -113,7 +144,7 @@ void delete_dir_recursively(const char *path) {
 }
 
 // synchronizacja katalogów src i dst
-void sync_dirs(const char *src, const char *dst, int recursive) {
+void sync_dirs(const char *src, const char *dst, int recursive, off_t threshold) {
 
     DIR *dir;
     struct dirent *entry;    // struktura przechowująca informacje o jednym wpisie
@@ -148,7 +179,7 @@ void sync_dirs(const char *src, const char *dst, int recursive) {
                     syslog(LOG_INFO, "Created dir: %s", dst_path);
                 }
                 // funkcja zatrzymuje się, wchodzi do podkatalogu
-                sync_dirs(src_path, dst_path, recursive);
+                sync_dirs(src_path, dst_path, recursive, threshold);
             }
             // instrukcja continue zeby pętla zignorowała ten wpis i poszła do kolejnego pliku/katalogu
             continue; 
@@ -175,7 +206,7 @@ void sync_dirs(const char *src, const char *dst, int recursive) {
         {
             // plik nie istnieje w dst - trzeba skopiować
             syslog(LOG_INFO, "New file, copying: %s", entry->d_name);
-            copy_file(src_path, dst_path, &src_stat);
+            copy_file(src_path, dst_path, &src_stat, threshold);
         }
         else
         {
@@ -183,7 +214,7 @@ void sync_dirs(const char *src, const char *dst, int recursive) {
             if (src_stat.st_mtime > dst_stat.st_mtime)
             {
                 syslog(LOG_INFO, "File modified, copying: %s", entry->d_name);
-                copy_file(src_path, dst_path, &src_stat);
+                copy_file(src_path, dst_path, &src_stat, threshold);
             }
         }
     }
@@ -242,20 +273,41 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    char *src = argv[1];
-    char *dst = argv[2];
+    char *src = NULL;
+    char *dst = NULL;
     int recursive = 0;
+    unsigned int sleep_time = 300; // domyślnie 5 minut
+    off_t threshold = DEFAULT_THRESHOLD;
+    int num_count = 0; // licznik opcjonalnych argumentów liczbowych
 
-    // Sprawdzamy, czy użytkownik podał 4 argumenty i czy tym czwartym jest "-R"
-    if (argc == 4 && strcmp(argv[3], "-R") == 0) {
-        recursive = 1;
+
+    // Sprawdzamy, czy użytkownik podał 4 argumenty i czy pierwszy z nich to -R
+    // parsujemy argumenty
+    int i = 1;
+    while (i < argc) {
+        if (strcmp(argv[i], "-R") == 0) {
+            recursive = 1;
+        } else if (src == NULL) {
+            src = argv[i];
+        } else if (dst == NULL) {
+            dst = argv[i];
+        } else {
+            // pierwszy licznik to sleep_time, drugi to threshold
+            if (num_count == 0) {
+                sleep_time = atoi(argv[i]);
+            } else {
+                threshold = atoi(argv[i]);
+            }
+            num_count++;
+        }
+        i++;
     }
 
     // Dodatkowe sprawdzenie czy podano obie sciezki
     if (src == NULL || dst == NULL) {
-        fprintf(stderr, "Błąd: Brak ścieżki źródłowej lub docelowej\n");
-        return 1;
-    }
+    fprintf(stderr, "Użycie: %s [-R] <src> <dst> [czas]\n", argv[0]);
+    return 1;
+}
 
     // stat - przechowuje infmacje o pliku st
     struct stat st;
@@ -293,9 +345,9 @@ int main(int argc, char *argv[]) {
     // Główna pętla
     while (1) {
         syslog(LOG_INFO, "Demon sie obudzil - sprawdzam katalogi");
-        sync_dirs(src, dst, recursive);
+        sync_dirs(src, dst, recursive, threshold);
         syslog(LOG_INFO, "Demon spi...");
-        sleep(10);
+        sleep(sleep_time);
     }
 
     closelog();
