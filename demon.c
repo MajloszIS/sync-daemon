@@ -8,6 +8,8 @@
 #include <signal.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <limits.h> // dla PATH_MAX
+
 
 #define BUFFER_SIZE 4096
 #define DEFAULT_THRESHOLD 1048576
@@ -48,8 +50,7 @@ void copy_file(const char *src_path, const char *dst_path, struct stat *src_stat
     }
 
     // otwieramy/tworzymy plik docelowy do zapisu
-    // 0644     - uprawnienia: właściciel czyta/pisze, reszta tylko czyta
-    int dst_fd = open(dst_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    int dst_fd = open(dst_path, O_WRONLY | O_CREAT | O_TRUNC, src_stat->st_mode);
     if (dst_fd < 0) {
         syslog(LOG_ERR, "Cannot open dest file: %s", dst_path);
         close(src_fd);
@@ -63,6 +64,15 @@ void copy_file(const char *src_path, const char *dst_path, struct stat *src_stat
         // DUŻY PLIK - używamy mmap
         syslog(LOG_INFO, "Using mmap for: %s", src_path);
 
+        if (file_size == 0) {
+            // Plik pusty, samo otwarcie O_CREAT i O_TRUNC go utworzyło/wyczyściło
+            syslog(LOG_INFO, "Empty file, created: %s", src_path);
+            close(src_fd);
+            close(dst_fd);
+            struct timespec times[2] = {src_stat->st_atim, src_stat->st_mtim};
+            utimensat(AT_FDCWD, dst_path, times, 0);
+            return;
+        }
         // mapujemy cały plik źródłowy do pamięci
         // PROT_READ - tylko do odczytu
         // MAP_SHARED - współdzielona mapa
@@ -75,7 +85,9 @@ void copy_file(const char *src_path, const char *dst_path, struct stat *src_stat
         }
 
         // zapisujemy całą mapę do pliku docelowego jednym wywołaniem write
-        write(dst_fd, map, file_size);
+        if (write(dst_fd, map, file_size) != file_size) {
+            syslog(LOG_ERR, "Write error for: %s", dst_path);
+        }
 
         // zwalniamy mapę z pamięci
         munmap(map, file_size);
@@ -89,7 +101,10 @@ void copy_file(const char *src_path, const char *dst_path, struct stat *src_stat
 
         // czytamy kawałkami i zapisujemy
         while ((bytes_read = read(src_fd, buffer, BUFFER_SIZE)) > 0) {
-            write(dst_fd, buffer, bytes_read);
+            if (write(dst_fd, buffer, bytes_read) != bytes_read) {
+                syslog(LOG_ERR, "Write error for: %s", dst_path);
+                break;
+            }
         }
     }
     
@@ -121,7 +136,7 @@ void delete_dir_recursively(const char *path) {
     DIR *dir = opendir(path);
     if (dir == NULL) return;
     struct dirent *entry;
-    char buf[1024];
+    char buf[PATH_MAX];
 
     // przechodzimy po zawartosci katalogu
     while ((entry = readdir(dir)) != NULL) {
@@ -149,8 +164,8 @@ void sync_dirs(const char *src, const char *dst, int recursive, off_t threshold)
     DIR *dir;
     struct dirent *entry;    // struktura przechowująca informacje o jednym wpisie
     struct stat src_stat, dst_stat;
-    char src_path[1024];
-    char dst_path[1024];
+    char src_path[PATH_MAX];
+    char dst_path[PATH_MAX];
 
     // przechodzimy po plikach w src
     dir = opendir(src); // otwieramy katalog - zwraca "uchwyt" do katalogu
@@ -260,10 +275,18 @@ void sync_dirs(const char *src, const char *dst, int recursive, off_t threshold)
 
     closedir(dir);
 }
-void sigusr1_handler(int signum) {
+
+volatile sig_atomic_t got_sigusr1 = 0;
+volatile sig_atomic_t running = 1;
+
+void sigterm_handler(int signum) {
+    running = 0;
     (void)signum;
-    syslog(LOG_INFO, "Odebrano sygnal SIGUSR1 - natychmiastowe wybudzenie demona");
-    // Gdy proces odbiera sygnał i wykonuje handler, trwająca funkcja sleep() w pętli głównej zostaje automatycznie przerwana
+}
+
+void sigusr1_handler(int signum) {
+    got_sigusr1 = 1;
+    (void)signum;
 }
 
 int main(int argc, char *argv[]) {
@@ -340,16 +363,33 @@ int main(int argc, char *argv[]) {
     // konfiguracja sysloga i logowanie informacji o uruchomieniu demona
     openlog("sync-daemon", LOG_PID, LOG_DAEMON);
     syslog(LOG_INFO, "Demon uruchomiony src=%s dst=%s", src, dst);
-    signal(SIGUSR1, sigusr1_handler);
+    // ustawienie handlera dla sygnału SIGUSR1
+    struct sigaction sa;
+    sa.sa_handler = sigusr1_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGUSR1, &sa, NULL);
+
+    struct sigaction sa_term;
+    sa_term.sa_handler = sigterm_handler;
+    sigemptyset(&sa_term.sa_mask);
+    sa_term.sa_flags = 0;
+    sigaction(SIGTERM, &sa_term, NULL);
 
     // Główna pętla
-    while (1) {
+    while (running) {
         syslog(LOG_INFO, "Demon sie obudzil - sprawdzam katalogi");
         sync_dirs(src, dst, recursive, threshold);
         syslog(LOG_INFO, "Demon spi...");
         sleep(sleep_time);
+        if (got_sigusr1) {
+            syslog(LOG_INFO, "Odebrano sygnal SIGUSR1...");
+            got_sigusr1 = 0;
+            continue; // natychmiastowa synchronizacja po sygnale
+        }
     }
 
+    syslog(LOG_INFO, "Demon zatrzymany");
     closelog();
     return 0;
 }
