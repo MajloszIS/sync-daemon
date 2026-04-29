@@ -48,8 +48,7 @@ void copy_file(const char *src_path, const char *dst_path, struct stat *src_stat
     }
 
     // otwieramy/tworzymy plik docelowy do zapisu
-    // 0644     - uprawnienia: właściciel czyta/pisze, reszta tylko czyta
-    int dst_fd = open(dst_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    int dst_fd = open(dst_path, O_WRONLY | O_CREAT | O_TRUNC, src_stat->st_mode);
     if (dst_fd < 0) {
         syslog(LOG_ERR, "Cannot open dest file: %s", dst_path);
         close(src_fd);
@@ -63,6 +62,15 @@ void copy_file(const char *src_path, const char *dst_path, struct stat *src_stat
         // DUŻY PLIK - używamy mmap
         syslog(LOG_INFO, "Using mmap for: %s", src_path);
 
+        if (file_size == 0) {
+            // Plik pusty, samo otwarcie O_CREAT i O_TRUNC go utworzyło/wyczyściło
+            syslog(LOG_INFO, "Empty file, created: %s", src_path);
+            close(src_fd);
+            close(dst_fd);
+            struct timespec times[2] = {src_stat->st_atim, src_stat->st_mtim};
+            utimensat(AT_FDCWD, dst_path, times, 0);
+            return;
+        }
         // mapujemy cały plik źródłowy do pamięci
         // PROT_READ - tylko do odczytu
         // MAP_SHARED - współdzielona mapa
@@ -260,10 +268,12 @@ void sync_dirs(const char *src, const char *dst, int recursive, off_t threshold)
 
     closedir(dir);
 }
+
+volatile sig_atomic_t got_sigusr1 = 0;
+
 void sigusr1_handler(int signum) {
+    got_sigusr1 = 1;
     (void)signum;
-    syslog(LOG_INFO, "Odebrano sygnal SIGUSR1 - natychmiastowe wybudzenie demona");
-    // Gdy proces odbiera sygnał i wykonuje handler, trwająca funkcja sleep() w pętli głównej zostaje automatycznie przerwana
 }
 
 int main(int argc, char *argv[]) {
@@ -348,6 +358,10 @@ int main(int argc, char *argv[]) {
         sync_dirs(src, dst, recursive, threshold);
         syslog(LOG_INFO, "Demon spi...");
         sleep(sleep_time);
+        if (got_sigusr1) {
+            syslog(LOG_INFO, "Odebrano sygnal SIGUSR1...");
+            got_sigusr1 = 0;
+        }
     }
 
     closelog();
